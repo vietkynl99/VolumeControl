@@ -2,7 +2,7 @@
   const SITES_KEY = 'sites';
   let currentVolume = 1;
   let hostname = null;
-  const trackedElements = new WeakSet();
+  const trackedElements = new Set();
 
   function clamp(v) {
     return Math.min(1, Math.max(0, v));
@@ -104,11 +104,16 @@
 
   // Re-assert volume periodically as a fallback net: some players (video.js,
   // HLS, ads) reset el.volume/muted back to their own default outside of a
-  // 'volumechange' event we'd otherwise catch immediately.
+  // 'volumechange' event we'd otherwise catch immediately. This only walks
+  // already-tracked elements (populated by the initial scan and the
+  // MutationObserver below) instead of re-querying the whole DOM/shadow tree
+  // every tick, which was previously the hot path on every frame.
   setInterval(() => {
-    const elements = [];
-    collectMediaElements(document, elements);
-    elements.forEach((el) => {
+    trackedElements.forEach((el) => {
+      if (!el.isConnected) {
+        trackedElements.delete(el);
+        return;
+      }
       if (!isInSync(el)) applyVolumeToElement(el);
     });
   }, 1500);

@@ -1,7 +1,15 @@
 (function () {
   const SITES_KEY = 'sites';
+  const MUTATION_DEBOUNCE_MS = 250;
+  const FAST_INTERVAL_MS = 1500;
+  const SLOW_INTERVAL_MS = 5000;
+
   let currentVolume = 1;
   let hostname = null;
+  let enforcementActive = false;
+  let mutationDebounce = null;
+  let fastIntervalId = null;
+  let slowIntervalId = null;
   const trackedElements = new Set();
 
   function clamp(v) {
@@ -31,6 +39,16 @@
     }
   }
 
+  function refreshTrackedElements() {
+    trackedElements.forEach((el) => {
+      if (!el.isConnected) {
+        trackedElements.delete(el);
+        return;
+      }
+      if (!isInSync(el)) applyVolumeToElement(el);
+    });
+  }
+
   // Regular querySelectorAll cannot see into open shadow roots, which some
   // custom video-player elements use to host their <video>/<audio> tag.
   function collectMediaElements(root, out) {
@@ -40,11 +58,85 @@
     });
   }
 
-  function applyVolume(vol) {
-    currentVolume = clamp(vol);
+  function scanDeep() {
     const elements = [];
     collectMediaElements(document, elements);
     elements.forEach(trackElement);
+  }
+
+  // On a page that mutates its DOM heavily (e.g. YouTube's sidebar, chat,
+  // progress bar), a MutationObserver callback can fire dozens of times per
+  // second. Doing a shadow-DOM-aware `querySelectorAll('*')` walk on every
+  // single firing caused browser-wide lag, so the hot path here only runs the
+  // cheap tag-only query, debounced, and the expensive shadow walk is
+  // confined to a slow periodic fallback. Both only run at all while this
+  // site actually has a non-default volume/mute set — see start/stop below.
+  const observer = new MutationObserver(() => {
+    if (mutationDebounce) return;
+    mutationDebounce = setTimeout(() => {
+      mutationDebounce = null;
+      document.querySelectorAll('audio, video').forEach(trackElement);
+    }, MUTATION_DEBOUNCE_MS);
+  });
+
+  function observeDom() {
+    const root = document.documentElement || document.body;
+    if (root) {
+      observer.observe(root, { childList: true, subtree: true });
+    } else {
+      document.addEventListener('DOMContentLoaded', observeDom, { once: true });
+    }
+  }
+
+  // Most tabs never touch the volume for their site (default = 100%,
+  // unmuted), so there is nothing to enforce against page scripts. Only pay
+  // for the MutationObserver + polling once a site actually has a custom
+  // level, and tear it all down again if the user resets back to 100%.
+  function startEnforcement() {
+    if (enforcementActive) return;
+    enforcementActive = true;
+    scanDeep();
+    observeDom();
+    fastIntervalId = setInterval(refreshTrackedElements, FAST_INTERVAL_MS);
+    slowIntervalId = setInterval(scanDeep, SLOW_INTERVAL_MS);
+  }
+
+  function stopEnforcement() {
+    if (!enforcementActive) return;
+    enforcementActive = false;
+    observer.disconnect();
+    if (mutationDebounce) {
+      clearTimeout(mutationDebounce);
+      mutationDebounce = null;
+    }
+    if (fastIntervalId) {
+      clearInterval(fastIntervalId);
+      fastIntervalId = null;
+    }
+    if (slowIntervalId) {
+      clearInterval(slowIntervalId);
+      slowIntervalId = null;
+    }
+    // Restore anything we'd previously overridden before going idle.
+    trackedElements.forEach((el) => {
+      try {
+        el.volume = 1;
+        el.muted = false;
+      } catch (e) {
+        /* ignore */
+      }
+    });
+    trackedElements.clear();
+  }
+
+  function applyVolume(vol) {
+    currentVolume = clamp(vol);
+    if (currentVolume === 1) {
+      stopEnforcement();
+      return;
+    }
+    startEnforcement();
+    refreshTrackedElements();
   }
 
   function volumeFromSiteEntry(entry) {
@@ -72,55 +164,4 @@
       applyVolume(volumeFromSiteEntry(sites[hostname]));
     }
   });
-
-  // On a page that mutates its DOM heavily (e.g. YouTube's sidebar, chat,
-  // progress bar), a MutationObserver callback can fire dozens of times per
-  // second. Doing a shadow-DOM-aware `querySelectorAll('*')` walk on every
-  // single firing is what caused the browser-wide lag reported earlier, so
-  // the hot path here only runs the cheap tag-only query, debounced, and the
-  // expensive shadow walk is confined to a slow periodic fallback below.
-  const MUTATION_DEBOUNCE_MS = 250;
-  let mutationDebounce = null;
-
-  const observer = new MutationObserver(() => {
-    if (mutationDebounce) return;
-    mutationDebounce = setTimeout(() => {
-      mutationDebounce = null;
-      document.querySelectorAll('audio, video').forEach(trackElement);
-    }, MUTATION_DEBOUNCE_MS);
-  });
-
-  function startObserving() {
-    const root = document.documentElement || document.body;
-    if (root) {
-      observer.observe(root, { childList: true, subtree: true });
-    }
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', startObserving);
-  } else {
-    startObserving();
-  }
-
-  // Fast fallback net: re-assert volume on already-tracked elements in case a
-  // page resets it outside of a 'volumechange' event we'd otherwise catch.
-  setInterval(() => {
-    trackedElements.forEach((el) => {
-      if (!el.isConnected) {
-        trackedElements.delete(el);
-        return;
-      }
-      if (!isInSync(el)) applyVolumeToElement(el);
-    });
-  }, 1500);
-
-  // Slow fallback net: catches media elements added inside a shadow root,
-  // which the cheap document-wide query above cannot see into. Bounded to
-  // once every few seconds so it never becomes the hot path.
-  setInterval(() => {
-    const elements = [];
-    collectMediaElements(document, elements);
-    elements.forEach(trackElement);
-  }, 5000);
 })();

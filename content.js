@@ -73,20 +73,21 @@
     }
   });
 
-  const observer = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      mutation.addedNodes.forEach((node) => {
-        if (node.nodeType !== 1) return;
-        if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') {
-          trackElement(node);
-        }
-        if (typeof node.querySelectorAll === 'function') {
-          const nested = [];
-          collectMediaElements(node, nested);
-          nested.forEach(trackElement);
-        }
-      });
-    }
+  // On a page that mutates its DOM heavily (e.g. YouTube's sidebar, chat,
+  // progress bar), a MutationObserver callback can fire dozens of times per
+  // second. Doing a shadow-DOM-aware `querySelectorAll('*')` walk on every
+  // single firing is what caused the browser-wide lag reported earlier, so
+  // the hot path here only runs the cheap tag-only query, debounced, and the
+  // expensive shadow walk is confined to a slow periodic fallback below.
+  const MUTATION_DEBOUNCE_MS = 250;
+  let mutationDebounce = null;
+
+  const observer = new MutationObserver(() => {
+    if (mutationDebounce) return;
+    mutationDebounce = setTimeout(() => {
+      mutationDebounce = null;
+      document.querySelectorAll('audio, video').forEach(trackElement);
+    }, MUTATION_DEBOUNCE_MS);
   });
 
   function startObserving() {
@@ -102,12 +103,8 @@
     startObserving();
   }
 
-  // Re-assert volume periodically as a fallback net: some players (video.js,
-  // HLS, ads) reset el.volume/muted back to their own default outside of a
-  // 'volumechange' event we'd otherwise catch immediately. This only walks
-  // already-tracked elements (populated by the initial scan and the
-  // MutationObserver below) instead of re-querying the whole DOM/shadow tree
-  // every tick, which was previously the hot path on every frame.
+  // Fast fallback net: re-assert volume on already-tracked elements in case a
+  // page resets it outside of a 'volumechange' event we'd otherwise catch.
   setInterval(() => {
     trackedElements.forEach((el) => {
       if (!el.isConnected) {
@@ -117,4 +114,13 @@
       if (!isInSync(el)) applyVolumeToElement(el);
     });
   }, 1500);
+
+  // Slow fallback net: catches media elements added inside a shadow root,
+  // which the cheap document-wide query above cannot see into. Bounded to
+  // once every few seconds so it never becomes the hot path.
+  setInterval(() => {
+    const elements = [];
+    collectMediaElements(document, elements);
+    elements.forEach(trackElement);
+  }, 5000);
 })();
